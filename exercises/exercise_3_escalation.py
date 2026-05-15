@@ -29,36 +29,72 @@ from common.schemas import (
 console = Console()
 
 
-def node_fetch_pr(state):
+REVIEW_SYSTEM_PROMPT = """You are a senior software engineer reviewing a GitHub pull request.
+Return structured output only.
+
+Focus on correctness, security, data migrations, maintainability, and tests.
+When confidence is below 60%, populate escalation_questions with 2–4 specific,
+context-rich questions for the reviewer. Each question must mention the file,
+function, or diff section that made you uncertain and explain what answer would
+change the review.
+"""
+
+SYNTHESIZE_SYSTEM_PROMPT = """You are refining a pull-request review after a human reviewer answered
+escalation questions. Return a complete PRAnalysis. Incorporate the answers,
+raise confidence only when the answers genuinely reduce uncertainty, and keep
+comments actionable and tied to changed files/lines when possible.
+"""
+
+EDIT_SYSTEM_PROMPT = """You are revising an automated PR review after a human selected edit.
+Return a complete PRAnalysis. Keep valid findings, apply the human feedback,
+remove unsupported claims, and make the final review ready to post to GitHub.
+"""
+
+
+def node_fetch_pr(state: ReviewState) -> dict:
     console.print("[cyan]→ fetch_pr[/cyan]")
     with console.status("[dim]Fetching PR from GitHub...[/dim]"):
         pr = fetch_pr(state["pr_url"])
     console.print(f"  [green]✓[/green] {len(pr.files_changed)} files, head {pr.head_sha[:7]}")
-    return {"pr_title": pr.title, "pr_diff": pr.diff, "pr_files": pr.files_changed, "pr_head_sha": pr.head_sha}
+    return {
+        "pr_title": pr.title,
+        "pr_diff": pr.diff,
+        "pr_files": pr.files_changed,
+        "pr_head_sha": pr.head_sha,
+    }
 
 
-def node_analyze(state):
+def node_analyze(state: ReviewState) -> dict:
     console.print("[cyan]→ analyze[/cyan]")
     llm = get_llm().with_structured_output(PRAnalysis)
     with console.status("[dim]LLM reviewing the diff...[/dim]"):
         analysis = llm.invoke([
-            {"role": "system", "content": (
-                "Senior reviewer. Structured output. "
-                # TODO: add an instruction: if confidence < 60%, populate escalation_questions
-                # with 2–4 specific, context-rich questions (reference which file/section in the diff).
-            )},
-            {"role": "user", "content": f"Title: {state['pr_title']}\nDiff:\n{state['pr_diff']}"},
+            {"role": "system", "content": REVIEW_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"Title: {state['pr_title']}\n"
+                    f"Files changed: {', '.join(state.get('pr_files', []))}\n\n"
+                    f"Diff:\n{state['pr_diff']}"
+                ),
+            },
         ])
-    console.print(f"  [green]✓[/green] confidence={analysis.confidence:.0%}, {len(analysis.escalation_questions)} question(s)")
+    console.print(
+        f"  [green]✓[/green] confidence={analysis.confidence:.0%}, "
+        f"{len(analysis.escalation_questions)} question(s)"
+    )
     return {"analysis": analysis}
 
 
-def node_route(state):
+def node_route(state: ReviewState) -> dict:
     console.print("[cyan]→ route[/cyan]")
     c = state["analysis"].confidence
-    if c >= AUTO_APPROVE_THRESHOLD: decision = "auto_approve"
-    elif c < ESCALATE_THRESHOLD:    decision = "escalate"
-    else:                           decision = "human_approval"
+    if c >= AUTO_APPROVE_THRESHOLD:
+        decision = "auto_approve"
+    elif c < ESCALATE_THRESHOLD:
+        decision = "escalate"
+    else:
+        decision = "human_approval"
     console.print(f"  [green]✓[/green] decision=[bold]{decision}[/bold] (confidence={c:.0%})")
     return {"decision": decision}
 
@@ -66,34 +102,55 @@ def node_route(state):
 def node_escalate(state: ReviewState) -> dict:
     """Ask the reviewer specific questions; return their answers in state."""
     a = state["analysis"]
-    questions = a.escalation_questions
-    if not questions:
-        # fallback when the LLM didn't generate any questions
-        questions = ["What is the intent of this PR?", "Any migration concerns?"]
+    questions = a.escalation_questions or [
+        "What is the intent of this PR, and which behavior should be preserved?",
+        "Are there migration, security, or compatibility constraints not visible in the diff?",
+    ]
 
-    # TODO: call interrupt(payload) where payload kind="escalation" contains:
-    #       pr_url, confidence, confidence_reasoning, summary, risk_factors, questions.
-    # answers = interrupt({...})
-    # return {"escalation_answers": answers}
-    raise NotImplementedError("Call interrupt() with an escalation payload")
+    answers = interrupt({
+        "kind": "escalation",
+        "pr_url": state["pr_url"],
+        "confidence": a.confidence,
+        "confidence_reasoning": a.confidence_reasoning,
+        "summary": a.summary,
+        "risk_factors": a.risk_factors,
+        "questions": questions,
+    })
+    return {"escalation_answers": answers}
 
 
 def node_synthesize(state: ReviewState) -> dict:
     """Re-prompt LLM with the reviewer's answers and produce a refined review."""
-    # TODO:
-    #   - read state["escalation_answers"] (dict[question, answer])
-    #   - call get_llm().with_structured_output(PRAnalysis).invoke(...) with a prompt
-    #     containing the original diff + initial analysis + Q&A.
-    #   - return {"analysis": refined}
-    # `node_commit` will then post the refined review to the PR.
-    raise NotImplementedError("Synthesize a refined PRAnalysis using the reviewer answers")
+    console.print("[cyan]→ synthesize[/cyan]")
+    qa = "\n".join(
+        f"Q: {question}\nA: {answer}"
+        for question, answer in (state.get("escalation_answers") or {}).items()
+    )
+    llm = get_llm().with_structured_output(PRAnalysis)
+    with console.status("[dim]LLM refining review with reviewer answers...[/dim]"):
+        refined = llm.invoke([
+            {"role": "system", "content": SYNTHESIZE_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"Title: {state['pr_title']}\n\n"
+                    f"Initial analysis:\n{state['analysis'].model_dump_json(indent=2)}\n\n"
+                    f"Reviewer Q&A:\n{qa}\n\n"
+                    f"Diff:\n{state['pr_diff']}"
+                ),
+            },
+        ])
+    console.print(f"  [green]✓[/green] refined confidence={refined.confidence:.0%}")
+    return {"analysis": refined}
 
 
-def node_human_approval(state):
+def node_human_approval(state: ReviewState) -> dict:
     a = state["analysis"]
     response = interrupt({
-        "kind": "approval_request", "pr_url": state["pr_url"],
-        "confidence": a.confidence, "confidence_reasoning": a.confidence_reasoning,
+        "kind": "approval_request",
+        "pr_url": state["pr_url"],
+        "confidence": a.confidence,
+        "confidence_reasoning": a.confidence_reasoning,
         "summary": a.summary,
         "comments": [c.model_dump() for c in a.comments],
         "diff_preview": state["pr_diff"][:2000],
@@ -101,7 +158,46 @@ def node_human_approval(state):
     return {"human_choice": response.get("choice"), "human_feedback": response.get("feedback")}
 
 
-def _render_comment_body(state) -> str:
+def node_refined_approval(state: ReviewState) -> dict:
+    """Final confirmation after the low-confidence escalation has been refined."""
+    a = state["analysis"]
+    response = interrupt({
+        "kind": "refined_approval",
+        "pr_url": state["pr_url"],
+        "confidence": a.confidence,
+        "confidence_reasoning": a.confidence_reasoning,
+        "summary": a.summary,
+        "comments": [c.model_dump() for c in a.comments],
+        "diff_preview": state["pr_diff"][:2000],
+        "escalation_answers": state.get("escalation_answers") or {},
+    })
+    return {"human_choice": response.get("choice"), "human_feedback": response.get("feedback")}
+
+
+def node_auto_edit(state: ReviewState) -> dict:
+    console.print("[cyan]→ auto_edit[/cyan]")
+    llm = get_llm().with_structured_output(PRAnalysis)
+    with console.status("[dim]Rewriting review from human feedback...[/dim]"):
+        revised = llm.invoke([
+            {"role": "system", "content": EDIT_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"Human feedback: {state.get('human_feedback') or '(no feedback provided)'}\n\n"
+                    f"Current analysis:\n{state['analysis'].model_dump_json(indent=2)}\n\n"
+                    f"Diff:\n{state['pr_diff']}"
+                ),
+            },
+        ])
+    console.print(f"  [green]✓[/green] revised confidence={revised.confidence:.0%}")
+    return {"analysis": revised}
+
+
+def _route_after_human(state: ReviewState) -> str:
+    return "auto_edit" if state.get("human_choice") == "edit" else "commit"
+
+
+def _render_comment_body(state: ReviewState) -> str:
     a = state["analysis"]
     lines = [f"### Automated review (confidence {a.confidence:.0%})", "", a.summary, ""]
     for c in a.comments:
@@ -115,7 +211,7 @@ def _render_comment_body(state) -> str:
     return "\n".join(lines)
 
 
-def _post(state, label: str) -> str:
+def _post(state: ReviewState, label: str) -> str:
     try:
         post_review_comment(state["pr_url"], _render_comment_body(state))
         console.print(f"  [green]✓[/green] posted comment to {state['pr_url']}")
@@ -125,20 +221,18 @@ def _post(state, label: str) -> str:
         return "commit_failed"
 
 
-def node_commit(state):
+def node_commit(state: ReviewState) -> dict:
     console.print("[cyan]→ commit[/cyan]")
-    # Two paths converge here:
-    #   1. human_approval → commit (only post if approved)
-    #   2. escalate → synthesize → commit (always post the refined review)
-    if state.get("escalation_answers"):
-        return {"final_action": _post(state, "committed_after_escalation")}
     if state.get("human_choice") == "approve":
-        return {"final_action": _post(state, "committed")}
+        label = "committed_after_escalation" if state.get("escalation_answers") else "committed"
+        return {"final_action": _post(state, label)}
+    if state.get("human_choice") == "edit":
+        return {"final_action": _post(state, "committed_after_edit")}
     console.print(f"  [yellow]·[/yellow] skipping comment (choice={state.get('human_choice')})")
     return {"final_action": "rejected"}
 
 
-def node_auto_approve(state):
+def node_auto_approve(state: ReviewState) -> dict:
     console.print("[cyan]→ auto_approve[/cyan]  [dim]high confidence — posting directly[/dim]")
     return {"final_action": _post(state, "auto_approved")}
 
@@ -146,35 +240,52 @@ def node_auto_approve(state):
 def build_graph():
     g = StateGraph(ReviewState)
     for name, fn in [
-        ("fetch_pr", node_fetch_pr), ("analyze", node_analyze), ("route", node_route),
-        ("auto_approve", node_auto_approve), ("human_approval", node_human_approval),
-        ("commit", node_commit), ("escalate", node_escalate), ("synthesize", node_synthesize),
+        ("fetch_pr", node_fetch_pr),
+        ("analyze", node_analyze),
+        ("route", node_route),
+        ("auto_approve", node_auto_approve),
+        ("human_approval", node_human_approval),
+        ("commit", node_commit),
+        ("escalate", node_escalate),
+        ("synthesize", node_synthesize),
+        ("refined_approval", node_refined_approval),
+        ("auto_edit", node_auto_edit),
     ]:
         g.add_node(name, fn)
     g.add_edge(START, "fetch_pr")
     g.add_edge("fetch_pr", "analyze")
     g.add_edge("analyze", "route")
     g.add_conditional_edges(
-        "route", lambda s: s["decision"],
+        "route",
+        lambda s: s["decision"],
         {"auto_approve": "auto_approve", "human_approval": "human_approval", "escalate": "escalate"},
     )
     g.add_edge("auto_approve", END)
-    g.add_edge("human_approval", "commit")
+    g.add_conditional_edges("human_approval", _route_after_human, {"auto_edit": "auto_edit", "commit": "commit"})
+    g.add_edge("escalate", "synthesize")
+    g.add_edge("synthesize", "refined_approval")
+    g.add_conditional_edges("refined_approval", _route_after_human, {"auto_edit": "auto_edit", "commit": "commit"})
+    g.add_edge("auto_edit", "commit")
     g.add_edge("commit", END)
-    # TODO: wire escalate → synthesize → commit  (commit already → END)
     return g.compile(checkpointer=MemorySaver())
 
 
-def handle_interrupt(payload):
+def handle_interrupt(payload: dict) -> dict:
     kind = payload["kind"]
-    if kind == "approval_request":
+    if kind in {"approval_request", "refined_approval"}:
+        title = "Approve refined review?" if kind == "refined_approval" else "Approve?"
         console.print(Panel.fit(
             payload["summary"],
-            title=f"Approve? conf={payload['confidence']:.0%}",
+            title=f"{title} conf={payload['confidence']:.0%}",
             border_style="green",
         ))
-        choice = console.input("approve/reject/edit? ").strip().lower()
-        return {"choice": choice, "feedback": console.input("Feedback: ").strip()}
+        for c in payload.get("comments", []):
+            console.print(f"  [{c['severity']}] {c['file']}:{c.get('line') or '?'} — {c['body']}")
+        choice = ""
+        while choice not in {"approve", "reject", "edit"}:
+            choice = console.input("approve/reject/edit? ").strip().lower()
+        feedback = console.input("Feedback: ").strip() if choice != "approve" else ""
+        return {"choice": choice, "feedback": feedback}
     if kind == "escalation":
         console.print(Panel.fit(
             payload["summary"],
@@ -185,9 +296,10 @@ def handle_interrupt(payload):
     raise ValueError(kind)
 
 
-def main():
+def main() -> None:
     load_dotenv()
-    p = argparse.ArgumentParser(); p.add_argument("--pr", required=True)
+    p = argparse.ArgumentParser()
+    p.add_argument("--pr", required=True)
     args = p.parse_args()
 
     console.rule("[bold]Exercise 3 — escalation with reviewer Q&A[/bold]")
